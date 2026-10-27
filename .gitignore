@@ -1,0 +1,17 @@
+# Secret credentials
+.env
+
+# Logs and runtime artifacts
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
