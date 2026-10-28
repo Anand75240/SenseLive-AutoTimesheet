@@ -1,7 +1,7 @@
 """SenseLive Daily Timesheet Auto-Logger & Verifier.
-Automatically scans all projects in the workspace for daily git activity,
-audits Odoo timesheets, prompts the user if anything is missing/incomplete,
-and auto-fills 8-hour entries with matching projects, tasks, and descriptions.
+Automatically scans projects in the workspace for daily git activity,
+audits Odoo timesheets, and logs exactly ONE single clean 8.0-hour timesheet entry
+with a unified single description per day.
 """
 import os
 import sys
@@ -53,10 +53,6 @@ ODOO_URL = os.getenv("ODOO_URL", "https://portal.senselive.io")
 ODOO_DB = os.getenv("ODOO_DB", "SenseLIve")
 ODOO_USER = os.getenv("ODOO_USER", "")
 ODOO_PASS = os.getenv("ODOO_PASS", "")
-
-if not ODOO_USER or not ODOO_PASS:
-    # Check if run directly without setup
-    pass
 
 # Root workspace containing user projects
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", r"d:\claude\SenseLive"))
@@ -112,7 +108,7 @@ def prompt_user_no_work(target_date: datetime.date):
     
     Add-Type -AssemblyName Microsoft.VisualBasic
     $desc = [Microsoft.VisualBasic.Interaction]::InputBox(
-        "Enter task description for today's timesheet:",
+        "Enter task description for today's timesheet (single concise sentence):",
         "SenseLive Timesheet - Task Description",
         "Technical coordination, client calls, documentation, and sprint review"
     )
@@ -154,7 +150,7 @@ def prompt_user_guide_audit(target_date: datetime.date, issues: list):
     ps_script = f"""
     $wshell = New-Object -ComObject Wscript.Shell
     # 36 = Yes/No buttons (4) + Question icon (32). Timeout = 60s
-    $msg = "Timesheet Audit Alert for {today_str}:`n`n{issues_text}`n`nWould you like me to fix and fill the missing details automatically?"
+    $msg = "Timesheet Audit Alert for {today_str}:`n`n{issues_text}`n`nWould you like me to fix and log a single clean 8.0h timesheet entry automatically?"
     $choice = $wshell.Popup($msg, 60, "SenseLive Timesheet Audit - Guidance Needed", 36)
     
     if ($choice -ne 6) {{
@@ -190,6 +186,46 @@ def get_git_repos(root_dir: Path):
     return repos
 
 
+def synthesize_single_description(commits: list, repo_name: str) -> str:
+    """Creates a single clean, natural sentence from commits instead of multiple chained lines."""
+    if not commits:
+        return f"Development, optimization, and testing for {repo_name}."
+
+    def commit_priority(c: str) -> int:
+        cl = c.lower()
+        if "feat" in cl: return 100
+        if "fix" in cl: return 80
+        if "refactor" in cl or "perf" in cl: return 60
+        if "test" in cl: return 40
+        if "doc" in cl: return 30
+        return 10
+
+    sorted_commits = sorted(commits, key=commit_priority, reverse=True)
+
+    cleaned = []
+    for c in sorted_commits:
+        msg = c.strip()
+        if ":" in msg:
+            prefix, rest = msg.split(":", 1)
+            if any(t in prefix.lower() for t in ["feat", "fix", "chore", "refactor", "docs", "style", "test", "build"]):
+                msg = rest.strip()
+        if msg:
+            cleaned.append(msg[0].upper() + msg[1:])
+
+    if not cleaned:
+        return f"Ongoing development and system improvements for {repo_name}."
+
+    if len(cleaned) == 1:
+        desc = cleaned[0]
+    else:
+        desc = f"{cleaned[0]}, and {cleaned[1].lower()}."
+
+    desc = desc.strip().rstrip(".").strip() + "."
+    if len(desc) > 200:
+        desc = desc[:197] + "..."
+    return desc
+
+
 def get_daily_activity_for_repo(repo_path: Path, target_date: datetime.date):
     """Extracts commit messages and active file changes for today."""
     since_str = f"{target_date.isoformat()} 00:00:00"
@@ -216,13 +252,7 @@ def get_daily_activity_for_repo(repo_path: Path, target_date: datetime.date):
     if not commits and not uncommitted:
         return None
 
-    if commits:
-        desc = "; ".join(commits)
-    else:
-        desc = f"Active development and updates across {len(uncommitted)} files."
-
-    if len(desc) > 240:
-        desc = desc[:237] + "..."
+    desc = synthesize_single_description(commits, repo_path.name)
 
     return {
         "repo_name": repo_path.name,
@@ -231,6 +261,21 @@ def get_daily_activity_for_repo(repo_path: Path, target_date: datetime.date):
         "uncommitted_count": len(uncommitted),
         "description": desc,
     }
+
+
+def select_primary_project(active_projects: list):
+    """
+    Selects the single most significant project worked on today
+    to ensure only 1 clean timesheet line of 8.0 hours is logged.
+    """
+    if not active_projects:
+        return None
+    ranked = sorted(
+        active_projects,
+        key=lambda p: (len(p.get("commits", [])), p.get("uncommitted_count", 0)),
+        reverse=True
+    )
+    return ranked[0]
 
 
 def connect_odoo():
@@ -284,11 +329,11 @@ def select_best_task(models, uid, project_id: int, description: str):
         t_name = t['name'].lower()
         if "frontend" in desc_lower and "frontend" in t_name:
             return t['id'], t['name']
-        if ("backend" in desc_lower or "api" in desc_lower or "db" in desc_lower) and "backend" in t_name:
+        if ("backend" in desc_lower or "api" in desc_lower or "db" in desc_lower or "docker" in desc_lower) and "backend" in t_name:
             return t['id'], t['name']
         if ("test" in desc_lower or "bug" in desc_lower or "fix" in desc_lower) and "testing" in t_name:
             return t['id'], t['name']
-        if ("deploy" in desc_lower or "docker" in desc_lower or "server" in desc_lower) and "deployment" in t_name:
+        if ("deploy" in desc_lower or "container" in desc_lower or "server" in desc_lower) and "deployment" in t_name:
             return t['id'], t['name']
 
     return tasks[0]['id'], tasks[0]['name']
@@ -299,6 +344,9 @@ def audit_timesheet_entries(entries: list):
     issues = []
     total_hours = sum(e.get('unit_amount', 0.0) for e in entries)
     
+    if len(entries) > 1:
+        issues.append(f"Multiple entries found for today ({len(entries)} entries). Standard is 1 single entry of 8.0h.")
+
     missing_desc = [
         e for e in entries
         if not e.get('name') or e.get('name', '').strip() in ['/', '.', '-', ''] or len(e.get('name', '').strip()) < 5
@@ -321,64 +369,50 @@ def audit_timesheet_entries(entries: list):
     return issues, total_hours
 
 
-def log_projects_to_odoo(models, uid, target_date: datetime.date, active_projects: list, all_projects: list, clean_dummy_ids: list = None):
-    """Submits timesheet records to Odoo with proper projects, tasks, and hours."""
+def log_single_timesheet_to_odoo(models, uid, target_date: datetime.date, primary_project: dict, all_projects: list, clean_dummy_ids: list = None):
+    """Submits exactly ONE clean 8.0h timesheet record to Odoo with a single concise description."""
     if clean_dummy_ids:
         try:
             models.execute_kw(ODOO_DB, uid, ODOO_PASS, 'account.analytic.line', 'unlink', [clean_dummy_ids])
-            logging.info(f"Cleaned up {len(clean_dummy_ids)} dummy/placeholder entries: {clean_dummy_ids}")
+            logging.info(f"Cleaned up {len(clean_dummy_ids)} dummy/duplicate entries: {clean_dummy_ids}")
         except Exception as e:
             logging.warning(f"Could not unlink dummy entries: {e}")
 
-    hours_per_proj = round(8.0 / len(active_projects), 2)
-    logged_reports = []
-    missing_reports = []
+    repo_name = primary_project["repo_name"]
+    desc = primary_project["description"]
+    odoo_proj = match_odoo_project(models, uid, repo_name, all_projects)
 
-    for act in active_projects:
-        repo_name = act["repo_name"]
-        desc = act["description"]
-        odoo_proj = match_odoo_project(models, uid, repo_name, all_projects)
+    if not odoo_proj:
+        msg = f"Project '{repo_name}' not found on Odoo!"
+        logging.warning(msg)
+        notify_user("SenseLive Timesheet Auto-Logger", f"Warning: '{repo_name}' has no matching project on Odoo.", is_warning=True)
+        return False
 
-        if not odoo_proj:
-            msg = f"Project '{repo_name}' not found on Odoo!"
-            logging.warning(msg)
-            missing_reports.append(repo_name)
-            continue
+    proj_id = odoo_proj["id"]
+    proj_name = odoo_proj["name"]
+    task_id, task_name = select_best_task(models, uid, proj_id, desc)
 
-        proj_id = odoo_proj["id"]
-        proj_name = odoo_proj["name"]
-        task_id, task_name = select_best_task(models, uid, proj_id, desc)
+    entry = {
+        "name": desc,
+        "project_id": proj_id,
+        "unit_amount": 8.0,
+        "date": target_date.isoformat(),
+    }
+    if task_id:
+        entry["task_id"] = task_id
 
-        entry = {
-            "name": desc,
-            "project_id": proj_id,
-            "unit_amount": hours_per_proj,
-            "date": target_date.isoformat(),
-        }
-        if task_id:
-            entry["task_id"] = task_id
+    entry_id = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'account.analytic.line', 'create', [entry]
+    )
+    task_info = f" [Task: {task_name}]" if task_name else ""
+    logging.info(f"Logged 8.0h on '{proj_name}'{task_info} -> ID: {entry_id}")
 
-        entry_id = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASS, 'account.analytic.line', 'create', [entry]
-        )
-        task_info = f" [Task: {task_name}]" if task_name else ""
-        logging.info(f"Logged {hours_per_proj}h on '{proj_name}'{task_info} -> ID: {entry_id}")
-        logged_reports.append(f"{proj_name} ({hours_per_proj}h)")
-
-    notification_lines = []
-    if logged_reports:
-        notification_lines.append(f"Timesheet Logged for {target_date}:")
-        for item in logged_reports:
-            notification_lines.append(f"  * {item}")
-
-    if missing_reports:
-        notification_lines.append("\nWarning: Missing Odoo Projects:")
-        for item in missing_reports:
-            notification_lines.append(f"  * '{item}' has no matching project/task on Odoo.")
-
-    full_notification = "\n".join(notification_lines)
-    notify_user("SenseLive Timesheet Auto-Logger", full_notification, is_warning=bool(missing_reports))
-    return logged_reports, missing_reports
+    notify_user(
+        "SenseLive Timesheet Auto-Logger",
+        f"Timesheet Logged for {target_date}:\n* {proj_name} (8.0h){task_info}\n  \"{desc}\"",
+        is_warning=False
+    )
+    return True
 
 
 def run_daily_timesheet(target_date: datetime.date = None):
@@ -410,14 +444,14 @@ def run_daily_timesheet(target_date: datetime.date = None):
         {'fields': ['id', 'name', 'project_id', 'task_id', 'unit_amount']}
     )
 
-    # Case A: Timesheets already exist -> Audit every field
+    # Case A: Timesheets already exist -> Audit
     if existing_entries:
         issues, total_hours = audit_timesheet_entries(existing_entries)
         
-        if not issues:
+        if not issues and len(existing_entries) == 1:
             msg = (
                 f"Timesheet for {target_date} is already 100% complete!\n"
-                f"Logged: {total_hours}h across {len(existing_entries)} entries with all descriptions & tasks intact."
+                f"Logged: {total_hours}h on {existing_entries[0]['project_id'][1]} with description intact."
             )
             logging.info(msg)
             notify_user("SenseLive Timesheet Verified", msg, is_warning=False)
@@ -440,23 +474,21 @@ def run_daily_timesheet(target_date: datetime.date = None):
             if act:
                 active_projects.append(act)
 
-        if not active_projects:
+        primary = select_primary_project(active_projects)
+        if not primary:
             should_fill, custom_desc, custom_proj = prompt_user_no_work(target_date)
             if not should_fill:
                 return
-            active_projects.append({
+            primary = {
                 "repo_name": custom_proj,
                 "repo_path": None,
                 "commits": [],
                 "uncommitted_count": 0,
                 "description": custom_desc
-            })
+            }
 
-        dummy_ids = [
-            e['id'] for e in existing_entries
-            if e.get('unit_amount', 0.0) <= 0.0 or e.get('name', '').strip() in ['/', '.', '-', '']
-        ]
-        log_projects_to_odoo(models, uid, target_date, active_projects, all_projects, clean_dummy_ids=dummy_ids)
+        clean_ids = [e['id'] for e in existing_entries]
+        log_single_timesheet_to_odoo(models, uid, target_date, primary, all_projects, clean_dummy_ids=clean_ids)
         return
 
     # Case B: No timesheets exist at all -> Fill from today's work
@@ -468,7 +500,8 @@ def run_daily_timesheet(target_date: datetime.date = None):
         if act:
             active_projects.append(act)
 
-    if not active_projects:
+    primary = select_primary_project(active_projects)
+    if not primary:
         logging.info(f"No git commits or active file changes detected for {target_date}.")
         should_fill, custom_desc, custom_proj = prompt_user_no_work(target_date)
         if not should_fill:
@@ -476,15 +509,15 @@ def run_daily_timesheet(target_date: datetime.date = None):
             notify_user("SenseLive Timesheet", f"Timesheet skipped for {target_date} (No activity recorded).")
             return
 
-        active_projects.append({
+        primary = {
             "repo_name": custom_proj,
             "repo_path": None,
             "commits": [],
             "uncommitted_count": 0,
             "description": custom_desc
-        })
+        }
 
-    log_projects_to_odoo(models, uid, target_date, active_projects, all_projects)
+    log_single_timesheet_to_odoo(models, uid, target_date, primary, all_projects)
 
 
 if __name__ == "__main__":
